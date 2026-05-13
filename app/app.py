@@ -1,5 +1,5 @@
 # =========================
-# LOAN DEFAULT WEB APP - WITH PREPROCESSING
+# LOAN DEFAULT WEB APP - WITH FEATURE ENGINEERING
 # =========================
 
 import streamlit as st
@@ -18,7 +18,6 @@ import string
 def load_artifacts():
     model = joblib.load('models/loan_default_xgb_model.pkl')
     
-    # Load your preprocessing artifacts
     try:
         label_encoders = joblib.load('models/label_encoders.pkl')
     except:
@@ -34,62 +33,102 @@ def load_artifacts():
 model, label_encoders, imputer = load_artifacts()
 
 # =========================
-# PREPROCESS FUNCTION
+# FEATURE ENGINEERING
 # =========================
 
-def preprocess_input(df):
-    """Apply the same preprocessing as training"""
+def engineer_features(input_data):
+    """Create the same features used during model training"""
     
-    # Convert dates to numeric features (if that's how your model was trained)
-    for col in ['date_approved', 'date_disbursed', 'first_payment_due', 'maturity_date', 'client_dob']:
+    df = input_data.copy()
+    
+    # Convert dates
+    date_cols = ['date_approved', 'date_disbursed', 'first_payment_due', 'maturity_date', 'client_dob']
+    for col in date_cols:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col])
-            # Extract useful numeric features from dates
-            df[col + '_year'] = df[col].dt.year
-            df[col + '_month'] = df[col].dt.month
-            df[col + '_day'] = df[col].dt.day
     
-    # Drop original date columns if your model doesn't use them
-    date_cols = ['date_approved', 'date_disbursed', 'first_payment_due', 'maturity_date', 'client_dob']
-    df = df.drop(columns=[c for c in date_cols if c in df.columns], errors='ignore')
+    # Convert numeric columns
+    numeric_cols = ['amount_usd', 'annual_rate_pct', 'term_months', 'num_dependents', 
+                    'months_at_employer', 'monthly_income_usd', 'existing_obligations']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    # Apply label encoding for categorical columns
-    categorical_cols = df.select_dtypes(include=['object']).columns
+    # === Create Engineered Features ===
     
-    if label_encoders:
-        # Use saved label encoders
-        for col in categorical_cols:
-            if col in label_encoders:
+    # Customer age
+    if 'client_dob' in df.columns:
+        today = pd.Timestamp.now()
+        df['customer_age'] = (today - df['client_dob']).dt.days / 365.25
+    
+    # Debt-to-income ratio
+    if 'existing_obligations' in df.columns and 'monthly_income_usd' in df.columns:
+        df['debt_income_ratio'] = df['existing_obligations'] / df['monthly_income_usd'].replace(0, np.nan)
+        df['debt_income_ratio'] = df['debt_income_ratio'].fillna(0)
+    
+    # Estimated monthly payment (simple amortization)
+    if 'amount_usd' in df.columns and 'term_months' in df.columns and 'annual_rate_pct' in df.columns:
+        monthly_rate = df['annual_rate_pct'] / 100 / 12
+        term = df['term_months']
+        amount = df['amount_usd']
+        # Simple PMT formula
+        df['estimated_monthly_payment'] = amount * (monthly_rate * (1 + monthly_rate) ** term) / ((1 + monthly_rate) ** term - 1)
+        df['estimated_monthly_payment'] = df['estimated_monthly_payment'].fillna(amount / term)
+    
+    # Loan duration in days
+    if 'date_disbursed' in df.columns and 'maturity_date' in df.columns:
+        df['loan_duration_days'] = (df['maturity_date'] - df['date_disbursed']).dt.days
+    
+    # Loan-to-income ratio
+    if 'amount_usd' in df.columns and 'monthly_income_usd' in df.columns:
+        df['loan_income_ratio'] = df['amount_usd'] / (df['monthly_income_usd'].replace(0, np.nan) * 12)
+        df['loan_income_ratio'] = df['loan_income_ratio'].fillna(0)
+    
+    # Encode categorical variables
+    categorical_cols = ['product_code', 'payment_frequency', 'loan_purpose', 
+                        'client_gender', 'marital_status', 'employment_sector',
+                        'collateral_type', 'disbursement_channel', 'province']
+    
+    for col in categorical_cols:
+        if col in df.columns:
+            if label_encoders and col in label_encoders:
                 try:
                     df[col] = label_encoders[col].transform(df[col].astype(str))
                 except:
                     # Handle unseen categories
-                    df[col] = df[col].map(lambda x: -1 if x not in label_encoders[col].classes_ 
-                                         else label_encoders[col].transform([x])[0])
-    else:
-        # Fallback: simple label encoding
-        for col in categorical_cols:
-            df[col] = pd.factorize(df[col])[0]
+                    df[col] = -1
+            else:
+                # Simple label encoding
+                df[col] = pd.factorize(df[col].astype(str))[0]
     
-    # Apply imputer if needed
+    # Drop original date columns (model doesn't use them directly)
+    cols_to_drop = date_cols + ['ID']
+    df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors='ignore')
+    
+    # Apply imputer if available
     if imputer:
-        df = pd.DataFrame(imputer.transform(df), columns=df.columns)
+        try:
+            df_imputed = imputer.transform(df)
+            df = pd.DataFrame(df_imputed, columns=df.columns)
+        except:
+            df = df.fillna(0)
+    else:
+        df = df.fillna(0)
     
-    # Ensure all columns are numeric
-    df = df.astype(float)
-    
-    # Ensure correct column order matching training
+    # Ensure all features match model expectations
     if hasattr(model, 'feature_names_in_'):
-        # Drop any extra columns we created
-        df = df[[c for c in model.feature_names_in_ if c in df.columns]]
+        model_features = model.feature_names_in_
         
-        # Add missing columns with zeros
-        for col in model.feature_names_in_:
+        # Keep only features the model knows
+        df = df[[c for c in model_features if c in df.columns]]
+        
+        # Add missing features
+        for col in model_features:
             if col not in df.columns:
                 df[col] = 0
-                
+        
         # Reorder to match training
-        df = df[model.feature_names_in_]
+        df = df[model_features]
     
     return df
 
@@ -160,20 +199,14 @@ with col2:
     
     existing_obligations = st.number_input('Existing Obligations (USD)', min_value=0.0, value=0.0, step=100.0)
 
-# =========================
-# AUTO-GENERATED FIELDS
-# =========================
-
+# Auto-generated fields
 loan_id = 'LOAN-' + ''.join(random.choices(string.digits, k=8))
 date_approved = datetime.date.today()
 date_disbursed = date_approved + datetime.timedelta(days=7)
 first_payment_due = date_disbursed + datetime.timedelta(days=30)
 maturity_date = date_disbursed + datetime.timedelta(days=term_months * 30)
 
-# =========================
-# CREATE INPUT DATAFRAME
-# =========================
-
+# Create input dataframe
 input_data = pd.DataFrame({
     'ID': [loan_id],
     'product_code': [product_code],
@@ -208,10 +241,10 @@ st.markdown("---")
 if st.button('🔍 Predict Loan Risk', type='primary', use_container_width=True):
     
     try:
-        # Apply preprocessing
-        processed_input = preprocess_input(input_data.copy())
+        # Apply feature engineering
+        processed_input = engineer_features(input_data.copy())
         
-        # Make prediction with processed data
+        # Make prediction
         prediction = model.predict(processed_input)
         probability = model.predict_proba(processed_input)[:, 1]
         
@@ -233,20 +266,19 @@ if st.button('🔍 Predict Loan Risk', type='primary', use_container_width=True)
             risk_score = int(probability[0] * 1000)
             st.metric('Risk Score', f'{risk_score}/1000')
         
-        # Show debug info in expander
-        with st.expander("Debug: Processed Features"):
-            st.write("Processed dataframe shape:", processed_input.shape)
-            st.write("Columns:", list(processed_input.columns))
+        # Show debug info
+        with st.expander("🔍 Debug: Processed Features"):
+            st.write(f"Shape: {processed_input.shape}")
+            st.write("Features:", list(processed_input.columns))
             st.dataframe(processed_input.head())
             
     except Exception as e:
         st.error(f'Prediction error: {str(e)}')
         
-        # Fallback: Try with just numeric columns
-        st.info("Attempting fallback prediction with numeric features only...")
-        try:
-            numeric_df = input_data.select_dtypes(include=[np.number])
-            fallback_prediction = model.predict(numeric_df.iloc[:, :min(len(numeric_df.columns), 22)])
-            st.success("Fallback prediction succeeded")
-        except:
-            st.error("Fallback also failed. Please check model requirements.")
+        # Show what features the model expects vs what we created
+        with st.expander("🔍 Debug: Feature Mismatch"):
+            st.write("Model expects:", list(model.feature_names_in_)[:20], "...")
+            try:
+                st.write("We created:", list(engineer_features(input_data.copy()).columns)[:20], "...")
+            except:
+                pass
