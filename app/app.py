@@ -1,5 +1,5 @@
 # =========================
-# LOAN DEFAULT WEB APP - WITH FEATURE ENGINEERING
+# LOAN DEFAULT WEB APP - FINAL VERSION
 # =========================
 
 import streamlit as st
@@ -11,126 +11,75 @@ import random
 import string
 
 # =========================
-# LOAD MODEL AND PREPROCESSORS
+# LOAD ARTIFACTS
 # =========================
 
 @st.cache_resource
 def load_artifacts():
     model = joblib.load('models/loan_default_xgb_model.pkl')
-    
-    try:
-        label_encoders = joblib.load('models/label_encoders.pkl')
-    except:
-        label_encoders = None
-        
-    try:
-        imputer = joblib.load('models/imputer.pkl')
-    except:
-        imputer = None
-        
+    label_encoders = joblib.load('models/label_encoders.pkl')
+    imputer = joblib.load('models/imputer.pkl')
     return model, label_encoders, imputer
 
 model, label_encoders, imputer = load_artifacts()
 
 # =========================
-# FEATURE ENGINEERING
+# PREPROCESSING
 # =========================
 
-def engineer_features(input_data):
-    """Create the same features used during model training"""
-    
+def preprocess_input(input_data):
+    """Apply all preprocessing steps to match training"""
     df = input_data.copy()
     
-    # Convert dates
+    # Identify columns
     date_cols = ['date_approved', 'date_disbursed', 'first_payment_due', 'maturity_date', 'client_dob']
+    
+    # Convert dates to Unix timestamps
     for col in date_cols:
+        df[col] = pd.to_datetime(df[col], format='mixed', dayfirst=True).astype('int64') // 10**9
+    
+    # Label encode categorical columns
+    for col in label_encoders.keys():
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col])
+            try:
+                df[col] = label_encoders[col].transform(df[col].astype(str))
+            except ValueError:
+                df[col] = -1
     
-    # Convert numeric columns
-    numeric_cols = ['amount_usd', 'annual_rate_pct', 'term_months', 'num_dependents', 
-                    'months_at_employer', 'monthly_income_usd', 'existing_obligations']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+    # Convert product_code to numeric
+    if 'product_code' in df.columns:
+        df['product_code'] = pd.to_numeric(df['product_code'], errors='coerce')
     
-    # === Create Engineered Features ===
+    # Create engineered features
+    df['customer_age'] = (pd.Timestamp('today') - pd.to_datetime(df['client_dob'], unit='s')).dt.days // 365
     
-    # Customer age
-    if 'client_dob' in df.columns:
-        today = pd.Timestamp.now()
-        df['customer_age'] = (today - df['client_dob']).dt.days / 365.25
+    df['loan_duration_days'] = (pd.to_datetime(df['maturity_date'], unit='s') - pd.to_datetime(df['date_disbursed'], unit='s')).dt.days
     
-    # Debt-to-income ratio
-    if 'existing_obligations' in df.columns and 'monthly_income_usd' in df.columns:
-        df['debt_income_ratio'] = df['existing_obligations'] / df['monthly_income_usd'].replace(0, np.nan)
-        df['debt_income_ratio'] = df['debt_income_ratio'].fillna(0)
+    df['loan_income_ratio'] = df['amount_usd'] / (df['monthly_income_usd'] + 1)
     
-    # Estimated monthly payment (simple amortization)
-    if 'amount_usd' in df.columns and 'term_months' in df.columns and 'annual_rate_pct' in df.columns:
-        monthly_rate = df['annual_rate_pct'] / 100 / 12
-        term = df['term_months']
-        amount = df['amount_usd']
-        # Simple PMT formula
-        df['estimated_monthly_payment'] = amount * (monthly_rate * (1 + monthly_rate) ** term) / ((1 + monthly_rate) ** term - 1)
-        df['estimated_monthly_payment'] = df['estimated_monthly_payment'].fillna(amount / term)
+    df['debt_income_ratio'] = df['existing_obligations'] / (df['monthly_income_usd'] + 1)
     
-    # Loan duration in days
-    if 'date_disbursed' in df.columns and 'maturity_date' in df.columns:
-        df['loan_duration_days'] = (df['maturity_date'] - df['date_disbursed']).dt.days
+    # Fill NaN values
+    df = df.fillna(0)
     
-    # Loan-to-income ratio
-    if 'amount_usd' in df.columns and 'monthly_income_usd' in df.columns:
-        df['loan_income_ratio'] = df['amount_usd'] / (df['monthly_income_usd'].replace(0, np.nan) * 12)
-        df['loan_income_ratio'] = df['loan_income_ratio'].fillna(0)
+    # Apply imputer (was fitted on 27 columns including Target)
+    # The model expects 22 columns, imputer needs 27
+    # We need to add missing columns that imputer expects
+    for col in imputer.feature_names_in_:
+        if col not in df.columns:
+            df[col] = 0
     
-    # Encode categorical variables
-    categorical_cols = ['product_code', 'payment_frequency', 'loan_purpose', 
-                        'client_gender', 'marital_status', 'employment_sector',
-                        'collateral_type', 'disbursement_channel', 'province']
+    # Reorder to match imputer
+    df = df[imputer.feature_names_in_]
     
-    for col in categorical_cols:
-        if col in df.columns:
-            if label_encoders and col in label_encoders:
-                try:
-                    df[col] = label_encoders[col].transform(df[col].astype(str))
-                except:
-                    # Handle unseen categories
-                    df[col] = -1
-            else:
-                # Simple label encoding
-                df[col] = pd.factorize(df[col].astype(str))[0]
+    # Apply imputer
+    df_imputed = pd.DataFrame(imputer.transform(df), columns=df.columns)
     
-    # Drop original date columns (model doesn't use them directly)
-    cols_to_drop = date_cols + ['ID']
-    df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors='ignore')
+    # Select only the 22 features the model expects
+    model_features = list(model.feature_names_in_)
+    df_imputed = df_imputed[model_features]
     
-    # Apply imputer if available
-    if imputer:
-        try:
-            df_imputed = imputer.transform(df)
-            df = pd.DataFrame(df_imputed, columns=df.columns)
-        except:
-            df = df.fillna(0)
-    else:
-        df = df.fillna(0)
-    
-    # Ensure all features match model expectations
-    if hasattr(model, 'feature_names_in_'):
-        model_features = model.feature_names_in_
-        
-        # Keep only features the model knows
-        df = df[[c for c in model_features if c in df.columns]]
-        
-        # Add missing features
-        for col in model_features:
-            if col not in df.columns:
-                df[col] = 0
-        
-        # Reorder to match training
-        df = df[model_features]
-    
-    return df
+    return df_imputed
 
 # =========================
 # APP TITLE
@@ -138,7 +87,6 @@ def engineer_features(input_data):
 
 st.set_page_config(page_title="Loan Default Prediction", layout="wide")
 st.title('🏦 Loan Default Prediction System')
-st.write('Predict the likelihood of loan default using machine learning')
 
 # =========================
 # USER INPUTS
@@ -150,56 +98,28 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("Customer Information")
-    
-    client_gender = st.selectbox('Gender', ['Male', 'Female', 'Other'])
-    
-    client_dob = st.date_input(
-        'Date of Birth',
-        value=datetime.date(1990, 1, 1),
-        min_value=datetime.date(1940, 1, 1),
-        max_value=datetime.date(2006, 1, 1)
-    )
-    
+    client_gender = st.selectbox('Gender', ['Male', 'Female'])
+    client_dob = st.date_input('Date of Birth', value=datetime.date(1990, 1, 1))
     marital_status = st.selectbox('Marital Status', ['Single', 'Married', 'Divorced', 'Widowed'])
-    
     num_dependents = st.number_input('Number of Dependents', min_value=0, max_value=20, value=0)
-    
-    employment_sector = st.selectbox(
-        'Employment Sector',
-        ['Private', 'Government', 'Self-Employed', 'Unemployed', 'Retired', 'Student']
-    )
-    
-    months_at_employer = st.number_input('Months at Current Employer', min_value=0, value=24)
-    
+    employment_sector = st.selectbox('Employment Sector', ['Private', 'Government', 'Self-Employed', 'Unemployed'])
+    months_at_employer = st.number_input('Months at Employer', min_value=0, value=24)
     monthly_income_usd = st.number_input('Monthly Income (USD)', min_value=0.0, value=3000.0, step=100.0)
-    
-    province = st.selectbox('Province', ['Province1', 'Province2', 'Province3', 'Capital Region', 'North', 'South', 'East', 'West'])
+    province = st.selectbox('Province', ['Province1', 'Province2', 'Province3', 'Capital Region'])
 
 with col2:
     st.subheader("Loan Details")
-    
-    product_code = st.selectbox('Product Code', ['LOAN-001', 'LOAN-002', 'LOAN-003', 'LOAN-004', 'LOAN-005'])
-    
+    product_code = st.selectbox('Product Code', ['LOAN-001', 'LOAN-002', 'LOAN-003'])
     amount_usd = st.number_input('Loan Amount (USD)', min_value=100.0, value=10000.0, step=500.0)
-    
-    annual_rate_pct = st.number_input('Annual Interest Rate (%)', min_value=1.0, max_value=50.0, value=10.0, step=0.5)
-    
+    annual_rate_pct = st.number_input('Annual Rate (%)', min_value=1.0, max_value=50.0, value=10.0)
     term_months = st.number_input('Term (Months)', min_value=1, max_value=360, value=36)
-    
-    payment_frequency = st.selectbox('Payment Frequency', ['Monthly', 'Bi-weekly', 'Weekly', 'Quarterly'])
-    
-    loan_purpose = st.selectbox(
-        'Loan Purpose',
-        ['Home Purchase', 'Home Improvement', 'Debt Consolidation', 'Business', 'Education', 'Medical', 'Vehicle', 'Other']
-    )
-    
-    collateral_type = st.selectbox('Collateral Type', ['Property', 'Vehicle', 'Savings', 'None', 'Other'])
-    
-    disbursement_channel = st.selectbox('Disbursement Channel', ['Bank Transfer', 'Check', 'Cash', 'Mobile Money'])
-    
+    payment_frequency = st.selectbox('Payment Frequency', ['Monthly', 'Bi-weekly', 'Weekly'])
+    loan_purpose = st.selectbox('Loan Purpose', ['Home Purchase', 'Debt Consolidation', 'Business', 'Education'])
+    collateral_type = st.selectbox('Collateral Type', ['Property', 'Vehicle', 'Savings', 'None'])
+    disbursement_channel = st.selectbox('Disbursement Channel', ['Bank Transfer', 'Check', 'Cash'])
     existing_obligations = st.number_input('Existing Obligations (USD)', min_value=0.0, value=0.0, step=100.0)
 
-# Auto-generated fields
+# Generate auto fields
 loan_id = 'LOAN-' + ''.join(random.choices(string.digits, k=8))
 date_approved = datetime.date.today()
 date_disbursed = date_approved + datetime.timedelta(days=7)
@@ -233,52 +153,27 @@ input_data = pd.DataFrame({
 })
 
 # =========================
-# PREDICT BUTTON
+# PREDICT
 # =========================
 
 st.markdown("---")
 
 if st.button('🔍 Predict Loan Risk', type='primary', use_container_width=True):
-    
     try:
-        # Apply feature engineering
-        processed_input = engineer_features(input_data.copy())
-        
-        # Make prediction
+        processed_input = preprocess_input(input_data)
         prediction = model.predict(processed_input)
         probability = model.predict_proba(processed_input)[:, 1]
         
-        st.markdown("---")
-        st.subheader('📊 Prediction Result')
-        
         col1, col2, col3 = st.columns(3)
-        
         with col1:
             if prediction[0] == 1:
-                st.error('🔴 HIGH RISK - Default Likely')
+                st.error('🔴 HIGH RISK')
             else:
-                st.success('🟢 LOW RISK - Default Unlikely')
-        
+                st.success('🟢 LOW RISK')
         with col2:
             st.metric('Default Probability', f'{probability[0]:.1%}')
-        
         with col3:
-            risk_score = int(probability[0] * 1000)
-            st.metric('Risk Score', f'{risk_score}/1000')
-        
-        # Show debug info
-        with st.expander("🔍 Debug: Processed Features"):
-            st.write(f"Shape: {processed_input.shape}")
-            st.write("Features:", list(processed_input.columns))
-            st.dataframe(processed_input.head())
+            st.metric('Risk Score', f'{int(probability[0] * 1000)}/1000')
             
     except Exception as e:
-        st.error(f'Prediction error: {str(e)}')
-        
-        # Show what features the model expects vs what we created
-        with st.expander("🔍 Debug: Feature Mismatch"):
-            st.write("Model expects:", list(model.feature_names_in_)[:20], "...")
-            try:
-                st.write("We created:", list(engineer_features(input_data.copy()).columns)[:20], "...")
-            except:
-                pass
+        st.error(f'Error: {str(e)}')
